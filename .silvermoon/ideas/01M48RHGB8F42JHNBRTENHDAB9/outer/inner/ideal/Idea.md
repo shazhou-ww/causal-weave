@@ -61,6 +61,8 @@ d5e8eb251567eb60bd4af21fb280b0b0c5944e62。旧双端候选与分段设计不构�
 4. 变长字段带长度，frontier 以端 ID 的 UTF-8 字节排序，不做 Unicode 归一化。
 5. Web Crypto hash API 异步；输入 / 输出字节必须隔离，防止外部修改。
 6. 项目采用 Silvermoon v2 管理 idea，发布讨论稿不代表批准 API。
+7. channelId 只作为上层 API 的路由上下文，不进入 Envelope、规范字节或 hash，
+   也不作为外部 hash 隔离上下文。相同节点可在不同 channel 中具有相同 hash。
 
 除上述选择与已讨论的模型边界外，下文具体签名、规范编码布局、限额和接口名称均为提案。
 
@@ -68,7 +70,8 @@ d5e8eb251567eb60bd4af21fb280b0b0c5944e62。旧双端候选与分段设计不构�
 
 每个 channel 数学上有可数无限逻辑端；从未出现的端处于 bottom。
 实际 frontier 是有限支撑映射 endpointId -> messageHash，缺失维度等于 bottom。
-同一 hash 只有在同 channel、同端链中才可用于该维度。
+每次校验仅在当前 channel 快照的节点集合内解析 hash，并核对对应端链。
+channel 的路由、存储归属和输入集合隔离由上层保证，节点字节不证明 channel 归属。
 
 以 a <= b 表示 a 是 b 的同端链祖先或相等；bottom <= 任意合法版本。
 不同端的 hash 不能直接比较；同端不可比较的节点是 fork，不是普通并发。
@@ -78,7 +81,7 @@ d5e8eb251567eb60bd4af21fb280b0b0c5944e62。旧双端候选与分段设计不构�
 
 - n 的同端前驱就是 V[e]；缺失时为 bottom，不额外编码一个 prev 字段。
 - n.causalFrontier = V[e := h]；这是派生属性，不参与自身 hash。
-- V 引用的每个节点 q 都必须存在且归属于对应 channel 与端。
+- V 引用的每个节点 q 都必须存在于当前快照中，且 endpointId 对应引用维度。
 - 对每个被引用的 q，q.causalFrontier <= V，保证传递因果闭包。
 - 本端前驱 p 存在时，还必须满足 p.causalFrontier <= V，保证已观测位置不倒退。
 - 验证不能补 refs、补维度或删除显式非法维度来使输入通过。
@@ -112,7 +115,6 @@ interface AddressedNode {
 }
 
 interface Envelope {
-  readonly channelId: ChannelId;
   readonly endpointId: EndpointId;
   readonly observedFrontier: Frontier;
   readonly content: Uint8Array;
@@ -199,7 +201,6 @@ decodeEnvelope 不证明依赖存在；不能将解码成功描述为 channel �
 
 ```text
 ASCII("causal-weave") || 0x00
-lengthPrefixedUtf8(channelId)
 lengthPrefixedUtf8(endpointId)
 u32be(frontierEntryCount)
 重复 entryCount 次：
@@ -211,8 +212,9 @@ lengthPrefixedBytes(content)
 所有 length prefix 为 u32be 字节长度，不是字符长度；空 content 合法。
 同一 envelope 的 frontier key 必须按 UTF-8 字节严格递增；比较无符号字节，
 不使用 localeCompare 或 UTF-16 默认字符串排序。
-channel 隔离域、端归属、发送前沿和内容均参与 hash，
-固定前缀 ASCII("causal-weave") || 0x00 提供 hash 域隔离，不携带版本。
+端归属、发送前沿和内容均参与 hash，channelId 不参与。
+固定前缀 ASCII("causal-weave") || 0x00 提供库的 hash 域隔离，
+不提供 channel 隔离，也不携带版本。
 hash 不作为 envelope 字段；AddressedNode 是携带 hash 与规范字节的 API 值。
 
 解码拒绝错误固定前缀、无效 UTF-8、重复 / 乱序 key、越界长度、
@@ -257,10 +259,17 @@ type FrontierRelation = "equal" | "before" | "after" | "concurrent";
 且没有未纳入 currentFrontier 的额外 tip；currentFrontier 必须恰为各端唯一最大节点。
 空 nodes + 空 frontier 是合法空 channel。nodes 的输入顺序不影响结果。
 adapter 保证输入来自一个一致快照；核心不能证明外部存储真的如此。
+SnapshotInput.channelId、ChannelSnapshot.channelId 与 Endpoint.channelId
+仅标识上层已路由的 channel 上下文，不进入节点字节或 hash。
+adapter 只能提供目标 channel 已登记的节点；全局 blob 存在不等于该 channel 已登记。
+同一精确节点允许独立登记到多个 channel，核心不能据字节推断它来自哪里。
 核心验证完整性、缺依赖、端归属、前沿闭包、同端观测单调性及 fork。
 重复相同 AddressedNode 可幂等去重；相同 hash 不同字节显式报错。
 
-未知 hash 不能当作 bottom；存在的其他 channel / 端节点不能当作合法该维度。
+当前快照不存在的 hash 不能当作 bottom，也不能从其他 channel 或全局 blob 集合自动解析。
+端归属不符的节点不能当作合法该维度。
+上层若把其他 channel 的完整合法历史误路由为本 channel 输入，核心无法检测来源错误；
+不能承诺跨 channel 引用的内在识别或拒绝。
 compareVersions 的 fork 是诊断值；compareFrontiers 遇到任何 fork 返回错误，
 不能把同端 fork 归为跨端 concurrent。
 covers 只在两侧前沿均合法时返回 true / false；输入非法必须返回 error。
@@ -317,7 +326,7 @@ bindEndpoint 可绑定此前未出现的合法 ID，tip 为 null；
 
 发送时 request.causalFrontier 就是发送前沿 V，不是返回的新节点前沿：
 
-1. 验证 V 的形状、引用节点存在、channel 与端归属；不静默补全。
+1. 验证 V 的形状、引用节点存在于当前快照、端归属；不静默补全。
 2. V[本端] 必须等于 snapshot 本端 tip，否则 STALE_SELF_TIP。
 3. 若本端前驱存在，检查其 causalFrontier <= V，否则 OBSERVATION_REGRESSION。
 4. 检查传递闭包，否则 FRONTIER_NOT_CLOSED。按此顺序优先诊断本端观测倒退。
@@ -357,13 +366,16 @@ type AppendCommitResult =
     };
 ```
 
-adapter 必须在同一原子事务中核对 channel / 本端 expectedTip、保证依赖存在，
+adapter 必须在同一原子事务中核对路由 channel / 本端 expectedTip、
+保证依赖已登记于该 channel，
 登记精确 node.bytes 并更新本端 tip。其他端并发前进本身不使 append 失败。
 端链和节点字节必须不可变；GC / 删除不能绕过 requiredNodes 的闭包保护。
 fork 被其他写入引入时不能仍按旧快照提交。
 
-already-present 必须证明存储内有相同 hash、相同字节且该节点位于合法登记链上；
-只见到一个未登记 blob 不够。即使本端 tip 已有后继，也可报告相同历史节点重投。
+already-present 必须证明目标 channel 内有相同 hash、相同字节，
+且该节点位于该 channel 的合法登记链上；
+只见到全局 blob 或其他 channel 的登记不够。即使本端 tip 已有后继，
+也可报告相同历史节点重投。
 不得重新包装内容、添加时间或生成新节点来伪造幂等。
 
 currentFrontier 必须来自同一提交事务的一致结果视图，可能含未观察到的其他端。
@@ -390,7 +402,9 @@ interface MergePreconditions {
 planMerge 对输入严格验 hash / 编码，再与 snapshot 做集合并集，允许乱序输入。
 缺依赖时不返回部分成功计划；完整诊断后由调用方补齐并重新请求。
 任何同端分叉都拒绝整个候选，记录端、共同前驱和冲突的后继 hash，不选赢家。
-新节点依赖只可来自 snapshot 或同批输入；跨 channel 不合并。
+新节点依赖只可来自 snapshot 或同批输入，不能隐式从其他 channel 读取。
+上层负责将该批输入路由到目标 channel 并授权导入；核心仅验证候选并集的结构，
+不判断节点的源 channel，也不禁止相同历史由上层显式导入另一个 channel。
 同一精确节点重投列入 alreadyPresent；同 hash 异字节是完整性冲突。
 
 nodesToInsert 按确定性因果顺序输出原始规范字节；不重 hash 改 envelope。
@@ -438,7 +452,7 @@ type ErrorCode =
   | "INVALID_ENCODING" | "HASH_MISMATCH"
   | "HASH_COLLISION" | "CRYPTO_UNAVAILABLE" | "CRYPTO_FAILURE"
   | "UNKNOWN_HASH" | "MISSING_DEPENDENCIES"
-  | "CHANNEL_MISMATCH" | "ENDPOINT_MISMATCH"
+  | "ENDPOINT_MISMATCH"
   | "FRONTIER_NOT_CLOSED" | "OBSERVATION_REGRESSION"
   | "STALE_SELF_TIP" | "INVALID_CURRENT_FRONTIER"
   | "FORK" | "CAUSAL_CYCLE";
@@ -455,7 +469,8 @@ ErrorDetails 提案是按 code 判别的联合类型，而非 any / 任意字符
 - 格式错误：字段路径、字节 offset、原因；不把内容 c 放入错误或日志。
 - 限额错误：限额名、上限、实际值；不截断输入后返回成功。
 - 未知 / 缺依赖：hash 列表，以及引用的节点 / 维度。
-- channel / 端不匹配：expected 与 actual。
+- 端不匹配：expected 与 actual。channel 路由错误由上层检测和显式报告，
+  不从无 channel 字段的节点中伪造 CHANNEL_MISMATCH 诊断。
 - 不闭合 / 倒退：endpoint、requiredVersion、declaredVersion。
 - tip 过期：expectedTip 与 declaredTip。
 - fork：endpoint、commonPredecessor、两个冲突后继；证据来自实际链。
@@ -496,13 +511,16 @@ actuallyObservedFrontier 必须由应用真实选择；核心只能验证结构�
 ## 契约验证目标（批准后的实现依据）
 
 1. Node.js 与浏览器对同一向量生成逐字节相同 envelope / hash；
-   key 插入顺序变化不改变 hash，channel / 端 / V / c 的变化影响 hash。
+   key 插入顺序变化不改变 hash，端 / V / c 的变化影响 hash。
+   相同节点在不同 channel 中字节与 hash 相同。
 2. 空 channel、新端首次追加、任意有限多端和缺失 bottom 均有向量。
 3. 落后但合法的对端 tip 可发送；本端 tip 过期、观测倒退、缺闭包必须拒绝。
 4. 用同端链 ancestry 验证，不依赖字典序、整数序号或时间。
 5. 同端并发候选能各自规划，但 adapter CAS 只允许一个登记；
    不同端并发追加不被本端 CAS 无故阻断。
-6. 同一节点精确重投、乱序合并、缺依赖、fork、跨 channel 引用有明确结果。
+6. 同一节点精确重投、乱序合并、缺依赖、fork 有明确结果。
+   不在目标快照或同批输入中的依赖报告缺失，不查询其他 channel；
+   全局 blob 或其他 channel 登记不能当作本 channel 的 already-present。
 7. delta 满足精确集合差与依赖条件；拓扑顺序可复现且所有依赖先于节点。
 8. 无效 UTF-8、surrogate、重复 key、尾随字节、错误固定前缀、截断及超限严格拒绝。
 9. 修改外部输入 / 输出 Map、数组、buffer 不改变既有 snapshot 和节点事实。
@@ -522,8 +540,9 @@ actuallyObservedFrontier 必须由应用真实选择；核心只能验证结构�
 8. 合并提交采用完整前沿 CAS，还是逐端 CAS 与依赖保持前提？
 9. adapter receipt 类型是否随核心导出，还是只作为文档集成约定？
 10. Result / 错误判别结构是否满足调用者需求；缺依赖诊断是否需要批量全部证据？
-11. 跨 channel 已知节点传入 snapshot 是否整批拒绝（本文提案），
-    还是提供外部固定只读 resolver 以区分未知 hash 与跨 channel hash？
+11. 上层 channel 路由接口是否需要独立的绑定 Channel 对象，
+    还是保留 SnapshotInput.channelId 与计划前提中的路由标识？
+    无论选择哪种接口，channelId 均不进入 Envelope 或 hash。
 12. 包许可、发布接口和 npm 发布授权尚未确定；本文不触发发布。
 
 Implementation / Deployment 及 ledger 保持同步占位，待本文讨论完成、

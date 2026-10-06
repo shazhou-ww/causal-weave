@@ -55,8 +55,8 @@ d5e8eb251567eb60bd4af21fb280b0b0c5944e62。旧双端候选与分段设计不构�
 ## 已确认的设计方向
 
 1. TypeScript，面向 Node.js 与浏览器；内容为应用编码的不透明 Uint8Array。
-2. SHA-256 与确定性二进制编码；Envelope 不包含 protocolVersion。
-3. channelId 只用于上层路由，不进入 Envelope、规范字节或 hash，
+2. SHA-256 与确定性二进制编码；Message 不包含 protocolVersion。
+3. channelId 只用于上层路由，不进入 Message、规范字节或 hash，
    也不作为外部 hash 上下文。相同节点在不同 channel 可有相同 hash。
 4. Channel 是核心公共对象，不再通过 Endpoint 绑定来发送；
    send 参数明确 endpointId，读消息属于 Channel。
@@ -65,6 +65,10 @@ d5e8eb251567eb60bd4af21fb280b0b0c5944e62。旧双端候选与分段设计不构�
 7. 每个 channel 的消息有严格递增登记序号，与 hash 并存；
    序号不属于消息内容，不参与 hash，不用时间戳承担排序。
 8. 挂接持久化策略；send 成功表示精确节点已登记，不只是生成合法计划。
+9. 消息字段统一为 Message，发送与编码直接使用它，RegisteredMessage 扩展它，
+   不再分别定义 Envelope、SendRequest 或使用 observedFrontier 这一字段名。
+10. Message 包含 contentType，提示接收方内容格式；
+    核心保存但不做业务解码，contentType 随消息参与 hash。
 
 以下具体类型形状、错误方式和持久化策略签名仍是提案，
 不把短问答中的设计方向当作整个 Ideal 的 acceptIdeal。
@@ -80,16 +84,10 @@ function createChannel(options: {
 }): Channel;
 
 interface Channel {
-  send(request: SendRequest): Promise<SendReceipt>;
+  send(message: Message): Promise<SendReceipt>;
   read(request: ReadRequest): Promise<ReadPage>;
   getState(): Promise<ChannelState>;
   watch(observer: ChannelObserver): () => void;
-}
-
-interface SendRequest {
-  readonly endpointId: EndpointId;
-  readonly frontier: Frontier;
-  readonly content: Uint8Array;
 }
 
 interface SendReceipt {
@@ -131,20 +129,31 @@ type EndpointId = string & EndpointIdBrand;
 type MessageHash = string & MessageHashBrand;
 type Frontier = ReadonlyMap<EndpointId, MessageHash>;
 
-interface Envelope {
+interface Message {
   readonly endpointId: EndpointId;
-  readonly observedFrontier: Frontier;
+  readonly frontier: Frontier;
+  readonly contentType: string;
   readonly content: Uint8Array;
 }
 
-interface RegisteredMessage {
+interface RegisteredMessage extends Message {
   readonly sequence: number;
   readonly hash: MessageHash;
-  readonly endpointId: EndpointId;
-  readonly content: Uint8Array;
   readonly causalFrontier: Frontier;
 }
 ```
+
+Message 是发送、规范编码和内容寻址共同使用的数据，不再套一层 envelope 属性。
+RegisteredMessage 保留全部 Message 字段，再增加内容地址、登记序号和派生前沿。
+frontier 始终是发送前的因果依据；causalFrontier 包含消息自身；
+currentFrontier 则是 channel 的整体登记视图，三个名字不混用。
+
+contentType 是应用提供给接收方的格式提示，例如 application/json。
+核心不根据它解析 content，也不检查字节是否符合所声明的格式。
+相同字节但不同 contentType 声明是不同 Message，必须纳入完整性校验，
+不能在不改变 hash 的情况下替换格式提示。
+是否严格采用 MIME media type、允许何种字符 / 空值，以及长度上限仍待讨论；
+不自动改大小写、trim 或归一化来改变调用者的原始声明。
 
 brand 仅为编译期防误用标记，不提供认证或可信输入证明。
 ReadonlyMap 与 readonly Uint8Array 也不保证运行时不可变：
@@ -158,7 +167,7 @@ sequence 的 number 是暂定表示，实际范围 / 是否采用 bigint 尚待�
 
 ### send：明确发送方，反馈登记结果
 
-调用者提供 endpointId、真实发送前沿 V 与内容 c。
+调用者提供 Message：endpointId、真实发送前沿 frontier = V、contentType 与内容 c。
 Channel 读取一致存储视图、验证因果依据、生成规范节点，
 再通过持久化策略原子检查并登记。
 
@@ -248,7 +257,7 @@ unwatch();
    不要求无间隙；重投不再分配序号，不因失败而复用已登记序号。
 5. 提供按登记序号读取的能力及可取消的变化通知，明确报告 I/O / 订阅错误。
 
-sequence 只属于 channel 内登记元数据，不进入 Envelope 或 hash。
+sequence 只属于 channel 内登记元数据，不进入 Message 的规范编码或 hash。
 同一节点在不同 channel 中 hash 相同，sequence 可以不同。
 不调用 Date.now() 来排序；时钟偏差、回拨和时间戳相同不影响登记顺序。
 
@@ -266,14 +275,14 @@ sequence 只属于 channel 内登记元数据，不进入 Envelope 或 hash。
 同端版本按链祖先关系比较，不按整数、sequence 或 hash 字符串大小比较。
 同端不可比较节点是 fork，明确拒绝，不选择赢家。
 
-节点 n 的本端前驱是 observedFrontier 中的本端项；不额外编码 prev。
+节点 n 的本端前驱是 frontier 中的本端项；不额外编码 prev。
 闭包提案：对前沿 V 引用的每个节点 q，q.causalFrontier <= V。
 例如 B1 观察 A1，后续引用 B1 的消息也必须在 V 中覆盖 A1。
 本端上一节点的 causalFrontier 也必须被 V 覆盖，保证观测不倒退。
 结构只能证明因果可达，不证明认知或业务处理。
 
 hash 仅在当前 channel 一致视图内解析并检查端归属，不自动查询其他 channel。
-Envelope 不含 channel，故核心不能从字节识别错误路由的完整合法历史；
+Message 不含 channel，故核心不能从字节识别错误路由的完整合法历史；
 channel 归属、身份认证和授权仍归上层。
 
 ### 编码与内容完整性
@@ -287,12 +296,15 @@ u32be(frontierEntryCount)
 重复 entryCount 次：
   lengthPrefixedUtf8(endpointId)
   rawSha256(32 bytes)
+lengthPrefixedUtf8(contentType)
 lengthPrefixedBytes(content)
 ```
 
 length prefix 为 u32be 字节长度；frontier key 按 UTF-8 无符号字节严格递增。
 不做 Unicode 归一化；固定前缀是库 hash 域隔离，不是 channel 隔离或协议版本。
 hash 不编码自身，sequence 与时间戳也不进入编码。
+只有 Message 的字段参与规范编码；RegisteredMessage 中额外的字段不参与 hash。
+contentType 按声明的 UTF-8 字节编码，与 frontier 和 content 一起受到 hash 保护。
 业务可以把一批有序 events 编码为一个 content，共享因果依据，
 核心不要求每个 event 一条消息，也不检查批内业务有效性。
 
@@ -320,6 +332,7 @@ const channel = createChannel({ persistence: strategyForThisChannel });
 const receipt = await channel.send({
   endpointId: myEndpointId,
   frontier: actuallyObservedFrontier,
+  contentType: "application/json",
   content: appEncodedOrderedEvents,
 });
 
@@ -339,8 +352,9 @@ send 的 receipt.currentFrontier 不替代 actuallyObservedFrontier。
 ## 契约验证目标（批准后的实现依据）
 
 1. 四个主操作构成普通使用路径，不依赖公开 Endpoint、追加计划或导入接口。
-2. 同一 Envelope 在 Node.js / 浏览器字节和 hash 一致；
+2. 同一 Message 在 Node.js / 浏览器字节和 hash 一致；
    key 插入顺序不影响结果，channel 与 sequence 不影响 hash。
+   只改变 contentType 的向量必须产生不同 hash，格式提示不能被未经核验地替换。
 3. 空 channel、新端首次发送、多端并发、落后但合法的对端位置都可处理。
 4. 本端 tip 过期、观测倒退、缺依赖、不闭合和 fork 明确失败且不改变声明。
 5. 本端 CAS 与 sequence 分配原子；不同端写入获得唯一序号，
@@ -366,8 +380,10 @@ send 的 receipt.currentFrontier 不替代 actuallyObservedFrontier。
 6. watch 初始通知、无漏订阅边界、观察者异常和订阅错误后的行为。
 7. read 条数 / 字节限额、资源 profile、AbortSignal 与关闭资源是否需要接口。
 8. Node.js / 浏览器支持矩阵、ESM / CJS、exports、最低 TS 版本、工具链和许可。
-9. 精确编码布局及 hash 规则的长期兼容性；不在 Envelope 添加版本字段。
+9. 精确编码布局及 hash 规则的长期兼容性；不在 Message 添加版本字段。
 10. npm 发布接口与授权尚未确定，本 idea 不触发 npm 发布。
+11. contentType 是否严格遵守 MIME media type，字符 / 空值 / 长度约束是什么；
+    核心不验证 content 的业务格式。
 
 Implementation、Deployment 与 ledger 保持同步占位。
 待用户明确批准精确 Ideal revision 后，再制定实施计划，不自动 acceptIdeal。

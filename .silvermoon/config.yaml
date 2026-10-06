@@ -1,0 +1,4 @@
+version: 2
+primaryRepository: https://github.com/shazhou-ww/causal-weave.git
+primaryBranch: main
+preferredLanguage: zh-CN

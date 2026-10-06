@@ -56,12 +56,13 @@ d5e8eb251567eb60bd4af21fb280b0b0c5944e62。旧双端候选与分段设计不构�
 
 1. 首个实现使用 TypeScript，面向 Node.js 与浏览器，不依赖 Silvermoon 业务代码。
 2. 内容 c 是不透明 Uint8Array，由应用编码，可以装一批有序 events。
-3. 使用 SHA-256 与版本化确定性二进制 envelope。
+3. 使用 SHA-256 与确定性二进制 envelope；定义的是库 API，不是网络协议，
+   Envelope 不包含 protocolVersion，也不编码协议版本字段。
 4. 变长字段带长度，frontier 以端 ID 的 UTF-8 字节排序，不做 Unicode 归一化。
 5. Web Crypto hash API 异步；输入 / 输出字节必须隔离，防止外部修改。
 6. 项目采用 Silvermoon v2 管理 idea，发布讨论稿不代表批准 API。
 
-除上述选择与已讨论的模型边界外，下文具体签名、线格式、限额和接口名称均为提案。
+除上述选择与已讨论的模型边界外，下文具体签名、规范编码布局、限额和接口名称均为提案。
 
 ### 数学模型与不变量
 
@@ -111,7 +112,6 @@ interface AddressedNode {
 }
 
 interface Envelope {
-  readonly protocolVersion: 1;
   readonly channelId: ChannelId;
   readonly endpointId: EndpointId;
   readonly observedFrontier: Frontier;
@@ -193,13 +193,12 @@ decodeEnvelope 不证明依赖存在；不能将解码成功描述为 channel �
 操作受 maxInputBytes 等约束，先检查外部声明长度再分配 / 遍历；
 结果不是被截断的成功。具体建议数值、Node.js 最低版本和浏览器矩阵待讨论。
 
-### 3. 线格式提案
+### 3. 规范编码布局提案
 
-版本 1 的顺序：
+用于内容寻址与严格解码的确定性字节布局如下，不定义网络协议：
 
 ```text
 ASCII("causal-weave") || 0x00
-u16be(protocolVersion = 1)
 lengthPrefixedUtf8(channelId)
 lengthPrefixedUtf8(endpointId)
 u32be(frontierEntryCount)
@@ -212,13 +211,15 @@ lengthPrefixedBytes(content)
 所有 length prefix 为 u32be 字节长度，不是字符长度；空 content 合法。
 同一 envelope 的 frontier key 必须按 UTF-8 字节严格递增；比较无符号字节，
 不使用 localeCompare 或 UTF-16 默认字符串排序。
-channel 隔离域、端归属、发送前沿和内容均参与 hash，魔数与版本提供协议域隔离。
-hash 不作为 envelope 字段；AddressedNode 是 API / 传输外壳。
+channel 隔离域、端归属、发送前沿和内容均参与 hash，
+固定前缀 ASCII("causal-weave") || 0x00 提供 hash 域隔离，不携带版本。
+hash 不作为 envelope 字段；AddressedNode 是携带 hash 与规范字节的 API 值。
 
-解码拒绝未知版本、错误魔数、无效 UTF-8、重复 / 乱序 key、越界长度、
+解码拒绝错误固定前缀、无效 UTF-8、重复 / 乱序 key、越界长度、
 不完整字段、超限和尾随字节。不得用宽松 UTF-8 replacement 代替错误。
 合法字节严格解码后重编码必须逐字节相同。
-升级版本须显式新规则，不让旧解码器猜测未来格式。
+未来若改变规范编码或 hash 规则，必须明确其兼容性与内容地址影响；
+不能以自动猜测格式或向 Envelope 添加协议版本字段来代替 API 兼容性设计。
 
 ### 4. 固定一致快照
 
@@ -434,7 +435,7 @@ traverse 返回 Past(frontier) 的确定性拓扑序：
 type ErrorCode =
   | "INVALID_ID" | "INVALID_HASH" | "INVALID_FRONTIER"
   | "INVALID_OPTIONS" | "LIMIT_EXCEEDED"
-  | "INVALID_ENCODING" | "UNSUPPORTED_VERSION" | "HASH_MISMATCH"
+  | "INVALID_ENCODING" | "HASH_MISMATCH"
   | "HASH_COLLISION" | "CRYPTO_UNAVAILABLE" | "CRYPTO_FAILURE"
   | "UNKNOWN_HASH" | "MISSING_DEPENDENCIES"
   | "CHANNEL_MISMATCH" | "ENDPOINT_MISMATCH"
@@ -503,7 +504,7 @@ actuallyObservedFrontier 必须由应用真实选择；核心只能验证结构�
    不同端并发追加不被本端 CAS 无故阻断。
 6. 同一节点精确重投、乱序合并、缺依赖、fork、跨 channel 引用有明确结果。
 7. delta 满足精确集合差与依赖条件；拓扑顺序可复现且所有依赖先于节点。
-8. 无效 UTF-8、surrogate、重复 key、尾随字节、未知版本、截断及超限严格拒绝。
+8. 无效 UTF-8、surrogate、重复 key、尾随字节、错误固定前缀、截断及超限严格拒绝。
 9. 修改外部输入 / 输出 Map、数组、buffer 不改变既有 snapshot 和节点事实。
 10. snapshotFrontier、causalFrontier、proposedFrontier 与提交 currentFrontier
     用可观察案例区分；不产生“合法计划即提交成功”的接口。
@@ -515,7 +516,7 @@ actuallyObservedFrontier 必须由应用真实选择；核心只能验证结构�
 3. Frontier 选择 ReadonlyMap，还是冻结的 null-prototype record / entries 值对象？
 4. 是否接受绑定 snapshot 的 Endpoint、planAppend 命名与发送参数 causalFrontier？
    是否把参数改名 observedFrontier，以减少与返回 causalFrontier 混淆？
-5. 是否接受本线格式 / ID 与 hash 表示？ID 允许哪些字符、上限如何设置？
+5. 是否接受本规范编码布局 / ID 与 hash 表示？ID 允许哪些字符、上限如何设置？
 6. Node.js / 浏览器支持矩阵、ESM / CJS、包 exports、最低 TS 版本与工具链尚未确定。
 7. Limits 的具体数值是否提供默认 profile？是否需要 AbortSignal / 流式接口？
 8. 合并提交采用完整前沿 CAS，还是逐端 CAS 与依赖保持前提？

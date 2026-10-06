@@ -71,6 +71,10 @@ d5e8eb251567eb60bd4af21fb280b0b0c5944e62。旧双端候选与分段设计不构�
     核心保存但不做业务解码，contentType 随消息参与 hash。
 11. RegisteredMessage 不保存可推导的 causalFrontier 字段，
     仅在 Message 上增加 hash 和 sequence；包含自身的因果前沿由内部计算。
+12. Strategy 提供底层存储原语，不理解消息的因果规则；所有合法性检查由 Channel 执行。
+13. 不要求 acquireLock、snapshot 或 withRead。
+    append 使用 channel 最新已登记序号 expectedSequence 作原子乐观条件；
+    空 channel 的最新序号为 0，Frontier 不是存储 revision。
 
 以下具体类型形状、错误方式和持久化策略签名仍是提案，
 不把短问答中的设计方向当作整个 Ideal 的 acceptIdeal。
@@ -78,7 +82,7 @@ d5e8eb251567eb60bd4af21fb280b0b0c5944e62。旧双端候选与分段设计不构�
 ## 顶层 API 提案
 
 下列声明用于讨论形状，不是已经实现的源文件。
-PersistenceStrategy 是后续需要共同确定的扩展点，本版不伪定其方法签名。
+PersistenceStrategy 的底层接口形状见后文，具体签名仍是讨论提案。
 
 ```ts
 function createChannel(options: {
@@ -172,8 +176,9 @@ sequence 的 number 是暂定表示，实际范围 / 是否采用 bigint 尚待�
 ### send：明确发送方，反馈登记结果
 
 调用者提供 Message：endpointId、真实发送前沿 frontier = V、contentType 与内容 c。
-Channel 读取一致存储视图、验证因果依据、生成规范节点，
-再通过持久化策略原子检查并登记。
+Channel 先读取最新已登记序号 S，再读取截至 S 的历史，
+验证因果依据、生成规范节点，然后调用 append(expectedSequence: S)。
+策略只原子比较存储序号并登记，不执行因果检查。
 
 - V 的本端项必须等于本端当前 tip；缺失表示 bottom。
 - 对端位置可落后于最新 tip，但必须合法且不低于本端上一消息已观测的位置。
@@ -181,7 +186,9 @@ Channel 读取一致存储视图、验证因果依据、生成规范节点，
 - 新节点 hash 为 h；包含自身的前沿 C(message) 是 V 将本端项更新为 h，
   由内部推导，不增加公开字段。
 - 成功返回原子登记结果；message.sequence 是该 channel 的登记序号。
-- currentFrontier 来自同一提交事务的结果视图，可能含未观察到的其他端消息。
+- currentFrontier 由 Channel 从截至成功登记序号的固定历史前缀计算，
+  不要求策略理解或返回 Frontier；可能含未观察到的其他端消息。
+  精确历史重投时使用本次读取边界 S 的前沿，不伪称恢复了原登记时的最新状态。
 - C(message) 覆盖消息自身因果历史；不能用 currentFrontier 替代。
 
 反馈只表示已登记，不表示对端已读取、处理、批准或回复。
@@ -193,14 +200,18 @@ Channel 读取一致存储视图、验证因果依据、生成规范节点，
 若相同 hash 对应不同字节、或只在全局 blob 中存在而未在目标 channel 登记，
 不能当作成功重投。
 
-CAS 冲突必须显式报告；重新读取也不得静默改写原发送依据。
+策略显式返回存储 CAS 冲突，Channel 保持原 Message 不变，重新读取并完整核验后重试。
+其他端追加也会推进 channel 序号、造成存储冲突，但本身不是消息的因果错误。
+若本端已前进且不是精确重投，则原消息不能继续追加，Channel 显式报告本端 tip 过期。
+重试次数 / 取消规则待定，不允许无限隐藏重试或把耗尽当成成功。
 不同端可以并发发送，但策略仍需为成功登记原子分配 channel 全局序号。
 首次出现的端可以从 bottom 发送，不需核心 join；
 endpointId 的使用权由上层验证，开放维度不等于业务授权。
 
 ### read：Frontier 续读，按登记序号分页
 
-每次调用取得固定一致视图 F，返回 Past(F) 中尚未被 Past(after) 覆盖的消息，
+每次调用先读取最新已登记序号 S，Channel 以不可变历史前缀 sequence <= S
+计算一致视图 F，返回 Past(F) 中尚未被 Past(after) 覆盖的消息，
 按 sequence 升序取最多 limit 条。Past 包含前沿引用节点及其全部因果历史。
 after 必须是目标 channel 内合法、闭合且被 F 覆盖的前沿；
 未知 hash、缺依赖或非法前沿显式失败，不自动重置为起点。
@@ -216,6 +227,12 @@ after 必须是目标 channel 内合法、闭合且被 F 覆盖的前沿；
 - 无剩余时返回空 messages、与 after 相等的 nextFrontier 和 hasMore=false。
 - limit 必须是正整数且受资源限额约束，超限显式失败，不悄悄改值。
 
+底层 scan 只按序号扫描，不接收 Frontier，也不判断消息是否已观察。
+Channel 验证 after、过滤已覆盖消息、累计 nextFrontier，并判断 hasMore。
+一次底层 scan 可能被过滤为空，不能据此当作读取结束；
+需要继续扫描直到达到返回上限、确认还有剩余，或到达本次边界 S。
+具体边界参数形状见后文提案，写入 CAS 本身不提供读取分页的一致性。
+
 依赖先登记，故按 sequence 返回时，本页节点的依赖要么已被 after 覆盖，
 要么先在本页输出。累计前沿可在下一次调用中继续使用，不需要另造游标。
 消息消费成功后，应用再保存 nextFrontier；核心不声称应用已完成业务处理。
@@ -227,7 +244,8 @@ Frontier 表达因果进度，sequence 表达排序位置，两者不互相替�
 
 ### getState：查看当前前沿
 
-返回一致视图中的 currentFrontier，缺失端为 bottom。
+先读取最新已登记序号 S，由 Channel 基于截至 S 的不可变历史
+计算 currentFrontier，缺失端为 bottom。策略不提供业务 getFrontier。
 调用者可据此决定是否读取，但拿到状态不等于观察或处理了前沿覆盖的内容。
 默认不枚举无限个尚未出现的端。
 
@@ -251,17 +269,108 @@ unwatch();
 
 ## 持久化策略：扩展点，不是具体存储实现
 
-公共 Channel 编排操作，纯计算内核负责因果与完整性，
-策略提供一致快照、读取节点与登记能力。普通调用者不手动执行 planAppend。
-策略不能只提供 save(node)，至少要兑现下列语义：
+### 底层接口形状提案
 
-1. 绑定目标 channel，隔离其登记集合；全局 blob 存在不代表该 channel 已登记。
-2. 每次读取 / 校验期间提供固定一致快照；允许按需访问，但多次读不能漂移。
-3. 在同一原子登记操作中检查本端 expected tip、依赖已登记且不变，
-   保存精确节点、更新本端 tip、分配 sequence 并返回一致 currentFrontier。
-4. channel 内序号唯一、严格递增，已登记序号不可变，依赖序号小于消息序号。
-   不要求无间隙；重投不再分配序号，不因失败而复用已登记序号。
-5. 提供按登记序号读取的能力及可取消的变化通知，明确报告 I/O / 订阅错误。
+策略由调用方提供，只负责登记记录的持久化、查询、序号 CAS 与存储变化通知。
+Channel 负责 hash、端 tip、祖先关系、闭包、观测单调性、fork、幂等判断和分页前沿。
+不向策略传入 expectedTip、Frontier 或“消息是否合法”的检查回调，
+也不要求策略创建 snapshot / withRead 作用域或暴露悲观锁。
+
+```ts
+interface PersistenceStrategy {
+  getLatestSequence(): Promise<number>;
+
+  get(hash: MessageHash): Promise<RegisteredMessage | undefined>;
+
+  scan(request: {
+    afterSequence: number;
+    throughSequence: number;
+    limit: number;
+  }): Promise<readonly RegisteredMessage[]>;
+
+  append(request: {
+    expectedSequence: number;
+    message: Message;
+    hash: MessageHash;
+  }): Promise<PersistenceAppendResult>;
+
+  watch(observer: PersistenceObserver): () => void;
+}
+
+type PersistenceAppendResult =
+  | { readonly ok: true; readonly message: RegisteredMessage }
+  | { readonly ok: false; readonly actualSequence: number };
+
+interface PersistenceObserver {
+  onChange(): void;
+  onError(error: Error): void;
+}
+```
+
+number 仍是暂定序号类型，与 RegisteredMessage.sequence 一致。
+scan 返回 afterSequence < sequence <= throughSequence 的记录，按序号升序取最多 limit 条。
+afterSequence=0 从头开始；throughSequence 是 Channel 先取得的最新已登记序号。
+它只是数值范围查询，不携带因果或已观察判断。
+此范围参数用于表达分页读取边界，具体签名仍可继续讨论。
+
+get 只查询目标 channel 的登记集合，缺失返回 undefined，I/O 失败显式抛出。
+若返回记录的 sequence > 本次边界 S，Channel 不把它纳入截至 S 的视图。
+Channel 可用 get 逐步读取前沿引用节点、端内前驱及传递依赖；
+需要从 scan 重建各端 tip / 当前前沿。缓存与索引优化不改变这些校验职责。
+
+### append 的乐观条件不是业务检查
+
+expectedSequence 是 channel 的最新已登记序号，不是 Message.frontier，
+也不是 frontier 引用节点序号的最大值。调用者可以真实地没有观察到最新消息。
+策略在一个原子存储操作中：
+
+1. 比较最新已登记序号与 expectedSequence。
+2. 不相等则返回 actualSequence，不写入、不分配已登记记录。
+3. 相等则原样保存 message 与 hash，分配大于现有最新序号的新序号，
+   原子公开登记记录及新的最新序号，返回 RegisteredMessage。
+
+策略不验证 hash、依赖或本端 tip，也不计算前沿；裸登记只附带通用存储 CAS。
+Channel 的 send 流程是：
+
+```text
+先读取最新序号 S
+→ 读取截至 S 的记录并核验，识别精确历史重投
+→ 重投返回原登记；否则验证原 Message
+→ append(expectedSequence: S)
+→ 存储冲突则保持原 Message，重新观察、核验后重试
+```
+
+相同 channel 的多个 Channel 实例 / 进程共用同一个存储序号 CAS。
+即使两者检查到相同本端 tip，也只有一个能按相同 S 登记；
+另一个重新核验，不能自动产生端内分叉。
+本端 tip 与依赖检查属于 Channel，不属于策略；
+全局序号 CAS 将已完成的这些检查绑定到实际登记的存储前态。
+
+### 只追加与读取边界
+
+用最新序号充当 revision 的前提：
+
+- 所有登记都通过同一原子 append，已登记记录及序号不可修改、删除或复用。
+- getLatestSequence 返回已提交记录的高水位，不是预分配或尚未落盘的序号。
+- 一旦高水位 S 可见，所有截至 S 的已登记记录均可读取；
+  不能以后再公开 sequence <= S 的新记录。
+- scan 范围完整且有序，get 可读已登记内容；不能使用无明确一致性保证的滞后副本。
+
+这些是存储语义，不是业务校验。由此截至 S 的历史前缀不变，
+后续并发写入只在 S 之后；Channel 可自己形成一致读取边界，不要求快照对象。
+遇到本次边界外的新引用 / 不稳定输入时不能按混合视图宣告校验成功，
+错误分类与重新观察规则需在实现契约中明确。
+
+若未来允许删除、改写或其他不推进登记序号的状态变化，
+最新序号就不足以充当 revision，需要另设版本机制，不能沿用本承诺。
+无间隙不是必要条件，但不能迟到填补旧高水位以内的空隙。
+读取分页的一致性依靠不可变前缀与明确边界，不依靠 append CAS 自动解决。
+
+### watch 与职责归属
+
+策略通知登记变化，不返回 Frontier；Channel 在通知后读取边界、计算状态，
+再调用公开 onChange。通知可以合并，需明确报告失败并提供幂等取消。
+初始状态和订阅注册如何避免漏变化仍待讨论。
 
 sequence 只属于 channel 内登记元数据，不进入 Message 的规范编码或 hash。
 同一节点在不同 channel 中 hash 相同，sequence 可以不同。
@@ -269,8 +378,11 @@ sequence 只属于 channel 内登记元数据，不进入 Message 的规范编�
 
 统一登记序号要求每个 channel 有统一排序点。这不是核心自动提供的分布式共识，
 也不能由多个独立副本各自分配序号后声称得到一个全局稳定顺序。
-策略的锁、CAS、事务、持久化、恢复、分页索引等实现由存储层负责。
-具体方法签名与快照生命周期下一轮再设计，不把旧完整数组快照固定为公共 API。
+存储 CAS、内部事务、持久化、恢复和分页索引的实现归策略；
+策略可自行选择内部机制，但公共接口不要求 acquireLock。
+消息依赖先于消息的登记顺序由 Channel 校验与条件登记共同保证，
+不能声称策略裸 append 会防止绕过 Channel 的非法写入。
+不信任可绕过本包写入者；发现坏历史时核心明确报错，不为其选赢家。
 
 ## 内部正确性边界
 
@@ -363,7 +475,8 @@ send 的 receipt.currentFrontier 不替代 actuallyObservedFrontier。
    只改变 contentType 的向量必须产生不同 hash，格式提示不能被未经核验地替换。
 3. 空 channel、新端首次发送、多端并发、落后但合法的对端位置都可处理。
 4. 本端 tip 过期、观测倒退、缺依赖、不闭合和 fork 明确失败且不改变声明。
-5. 本端 CAS 与 sequence 分配原子；不同端写入获得唯一序号，
+5. Channel 检查本端 tip 与依赖，策略只做 expectedSequence 的原子 CAS 和序号分配；
+   多实例同端竞争不产生分叉，其他端推进引发存储冲突后保留原消息重试。
    所有依赖先于消息，失败不返回登记成功。
 6. 精确重投返回原 sequence；tip 有后继也不新建记录；
    其他 channel 的登记或全局 blob 不能当作目标 channel 已登记。
@@ -376,14 +489,19 @@ send 的 receipt.currentFrontier 不替代 actuallyObservedFrontier。
 11. RegisteredMessage 仅扩展 hash 和 sequence，不返回冗余 causalFrontier；
     内部派生的 C(message) 与登记 currentFrontier 有并发案例区分，
     任何状态或反馈都不被描述为业务已处理。
+12. 最新序号先于校验读取；0 表示空 channel。以旧序号 append 原子失败且不写入。
+    分页固定 throughSequence 边界，过程中新增不会混入本页；
+    策略不需要理解 Frontier、实现快照对象或提供悲观锁。
 
 ## 待解决问题
 
-1. PersistenceStrategy 的最小方法集、固定快照边界、生命周期和变化通知保证。
+1. PersistenceStrategy 具体签名、scan 范围 / 完整性规则与变化通知保证；
+   不再要求 snapshot、withRead 或 acquireLock。
 2. sequence 使用 number、bigint 还是其他表示；合法范围与耗尽策略。
 3. Frontier 的容器与解析辅助函数；端 ID 和 hash 表示的精确约束。
 4. 是否接受传递闭包规则 C(q) <= V。
-5. Promise reject 或 Result、类型化错误与 CAS 冲突形状。
+5. Promise reject 或 Result、类型化错误、存储 CAS 的重试上限 / 取消、
+   读取边界外输入和最终发送冲突的错误形状。
 6. watch 初始通知、无漏订阅边界、观察者异常和订阅错误后的行为。
 7. read 条数 / 字节限额、资源 profile、AbortSignal 与关闭资源是否需要接口。
 8. Node.js / 浏览器支持矩阵、ESM / CJS、exports、最低 TS 版本、工具链和许可。

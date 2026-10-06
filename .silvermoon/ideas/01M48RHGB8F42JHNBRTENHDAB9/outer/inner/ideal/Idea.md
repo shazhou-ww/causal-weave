@@ -69,6 +69,8 @@ d5e8eb251567eb60bd4af21fb280b0b0c5944e62。旧双端候选与分段设计不构�
    不再分别定义 Envelope、SendRequest 或使用 observedFrontier 这一字段名。
 10. Message 包含 contentType，提示接收方内容格式；
     核心保存但不做业务解码，contentType 随消息参与 hash。
+11. RegisteredMessage 不保存可推导的 causalFrontier 字段，
+    仅在 Message 上增加 hash 和 sequence；包含自身的因果前沿由内部计算。
 
 以下具体类型形状、错误方式和持久化策略签名仍是提案，
 不把短问答中的设计方向当作整个 Ideal 的 acceptIdeal。
@@ -139,14 +141,16 @@ interface Message {
 interface RegisteredMessage extends Message {
   readonly sequence: number;
   readonly hash: MessageHash;
-  readonly causalFrontier: Frontier;
 }
 ```
 
 Message 是发送、规范编码和内容寻址共同使用的数据，不再套一层 envelope 属性。
-RegisteredMessage 保留全部 Message 字段，再增加内容地址、登记序号和派生前沿。
-frontier 始终是发送前的因果依据；causalFrontier 包含消息自身；
-currentFrontier 则是 channel 的整体登记视图，三个名字不混用。
+RegisteredMessage 保留全部 Message 字段，只增加内容地址和登记序号。
+frontier 始终是发送前的因果依据；包含自身的前沿可以从 frontier、
+endpointId 和 hash 推导，不重复保存或作为公开字段返回。
+内部记该派生值为 C(m) = m.frontier 将 m.endpointId 项更新为 m.hash，
+计算时生成新映射，不修改原 frontier。
+currentFrontier 则是 channel 的整体登记视图，不能替代发送依据或 C(m)。
 
 contentType 是应用提供给接收方的格式提示，例如 application/json。
 核心不根据它解析 content，也不检查字节是否符合所声明的格式。
@@ -174,10 +178,11 @@ Channel 读取一致存储视图、验证因果依据、生成规范节点，
 - V 的本端项必须等于本端当前 tip；缺失表示 bottom。
 - 对端位置可落后于最新 tip，但必须合法且不低于本端上一消息已观测的位置。
 - 不自动补依赖、替换成最新前沿或修改内容来使发送通过。
-- 新节点 hash 为 h；其 causalFrontier 是 V 将本端项更新为 h。
+- 新节点 hash 为 h；包含自身的前沿 C(message) 是 V 将本端项更新为 h，
+  由内部推导，不增加公开字段。
 - 成功返回原子登记结果；message.sequence 是该 channel 的登记序号。
 - currentFrontier 来自同一提交事务的结果视图，可能含未观察到的其他端消息。
-- message.causalFrontier 是消息自身因果历史；不能用 currentFrontier 替代。
+- C(message) 覆盖消息自身因果历史；不能用 currentFrontier 替代。
 
 反馈只表示已登记，不表示对端已读取、处理、批准或回复。
 业务回复仍是对端随后发送的普通消息，本包不提供隐式请求 / 响应语义。
@@ -203,8 +208,9 @@ after 必须是目标 channel 内合法、闭合且被 F 覆盖的前沿；
 返回规则：
 
 - messages 包含所有端的未观察消息，包括本端，不按读者身份过滤。
-- nextFrontier = after 累计覆盖本页消息的 causalFrontier；
-  按同端链祖先关系合并，不能直接用本页最后一条消息的 causalFrontier。
+- nextFrontier = after 累计覆盖本页消息的 C(message)；
+  按同端链祖先关系合并，不能直接用本页最后一条消息的 C(message)。
+  read 内部计算并返回累计结果，调用者无需逐条推导。
 - 不把尚未输出且未在 after 中覆盖的节点塞入 nextFrontier。
 - hasMore 仅表示本次一致视图内仍有剩余消息。
 - 无剩余时返回空 messages、与 after 相等的 nextFrontier 和 hasMore=false。
@@ -276,9 +282,9 @@ sequence 只属于 channel 内登记元数据，不进入 Message 的规范编�
 同端不可比较节点是 fork，明确拒绝，不选择赢家。
 
 节点 n 的本端前驱是 frontier 中的本端项；不额外编码 prev。
-闭包提案：对前沿 V 引用的每个节点 q，q.causalFrontier <= V。
+闭包提案：对前沿 V 引用的每个节点 q，C(q) <= V。
 例如 B1 观察 A1，后续引用 B1 的消息也必须在 V 中覆盖 A1。
-本端上一节点的 causalFrontier 也必须被 V 覆盖，保证观测不倒退。
+本端上一节点的 C(q) 也必须被 V 覆盖，保证观测不倒退。
 结构只能证明因果可达，不证明认知或业务处理。
 
 hash 仅在当前 channel 一致视图内解析并检查端归属，不自动查询其他 channel。
@@ -367,7 +373,8 @@ send 的 receipt.currentFrontier 不替代 actuallyObservedFrontier。
    空结果、hasMore 和非法 / 未知游标有明确可验证行为。
 9. watch 可取消、重复取消安全，取消后不启动新回调，订阅失败显式通知。
 10. 外部修改 Map / buffer 不改变内部事实；严格解码和资源限额有反例测试。
-11. causalFrontier 与登记 currentFrontier 有并发案例区分，
+11. RegisteredMessage 仅扩展 hash 和 sequence，不返回冗余 causalFrontier；
+    内部派生的 C(message) 与登记 currentFrontier 有并发案例区分，
     任何状态或反馈都不被描述为业务已处理。
 
 ## 待解决问题
@@ -375,7 +382,7 @@ send 的 receipt.currentFrontier 不替代 actuallyObservedFrontier。
 1. PersistenceStrategy 的最小方法集、固定快照边界、生命周期和变化通知保证。
 2. sequence 使用 number、bigint 还是其他表示；合法范围与耗尽策略。
 3. Frontier 的容器与解析辅助函数；端 ID 和 hash 表示的精确约束。
-4. 是否接受传递闭包规则 q.causalFrontier <= V。
+4. 是否接受传递闭包规则 C(q) <= V。
 5. Promise reject 或 Result、类型化错误与 CAS 冲突形状。
 6. watch 初始通知、无漏订阅边界、观察者异常和订阅错误后的行为。
 7. read 条数 / 字节限额、资源 profile、AbortSignal 与关闭资源是否需要接口。

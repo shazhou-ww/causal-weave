@@ -2,9 +2,9 @@
   "version": 1,
   "skills": {
     "silvermoon": {
-      "source": "../silvermoon/skills",
+      "source": "./node_modules/silvermoon/skills",
       "sourceType": "local",
-      "computedHash": "ca054f7b1e11965301b61d10ae99f99397d0100333eb497e419e8c165d9eaf82"
+      "computedHash": "efa97562e05334d1f3646d48bdb457dde155fb8481f4645c155c005ff232613f"
     }
   }
 }

@@ -1,0 +1,27 @@
+{
+  "name": "causal-weave",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Content-addressed multi-endpoint causal channels with pluggable persistence.",
+  "engines": { "node": ">=22" },
+  "packageManager": "pnpm@10.27.0",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" }
+  },
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit && tsc --noEmit --strict --module NodeNext --moduleResolution NodeNext --target ES2022 test/types.ts",
+    "test": "pnpm build && node --test test/*.test.mjs"
+  },
+  "devDependencies": {
+    "silvermoon": "^0.3.0",
+    "typescript": "^5.9.3"
+  },
+  "pnpm": {
+    "overrides": {
+      "silvermoon": "git+https://github.com/shazhou-ww/silvermoon.git#cfabf52936b7372d45f43e07ab813a2271fe4938"
+    }
+  }
+}

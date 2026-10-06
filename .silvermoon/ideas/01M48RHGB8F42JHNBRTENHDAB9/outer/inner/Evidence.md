@@ -15,7 +15,10 @@ Windows；Node.js v24.12.0；pnpm 10.27.0；TypeScript 5.9.3。
 - `npm pack --dry-run --json`：16 项，仅 README、package.json、dist JS / 声明；
   未实际生成发布包，也未执行 npm publish。
 - `pnpm exec silvermoon check --worktree --audience agent`：通过。
-  staged / remote 校验在发布候选时执行，不将此前观察当作未来校验证据。
+- `pnpm exec silvermoon check --staged --audience agent`：实现候选通过。
+- `pnpm exec silvermoon check --remote --audience agent`：实现提交
+  0dee19576ffd3b76b4946a671cd659558cbfa618 已进入 main，远端检查通过。
+  本证据更新自身也须重新通过 staged / remote 检查，才作为最终可验收候选。
 
 pnpm 提示 Silvermoon 间接原生依赖的 build scripts 未启用；
 没有自动批准执行这些脚本。本次所需 Silvermoon v2 检查实际通过，

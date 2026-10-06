@@ -102,7 +102,7 @@ interface Channel {
   watch(observer: ChannelObserver): Result<Unwatch, WatchStartError>;
 }
 
-type Unwatch = () => Promise<Result<void, WatchCancelError>>;
+type Unwatch = () => void;
 
 interface SendReceipt {
   readonly message: RegisteredMessage;
@@ -195,8 +195,10 @@ Channel 先读取最新已登记序号 S，再读取截至 S 的历史，
 - 新节点 hash 为 h；包含自身的前沿 C(message) 是 V 将本端项更新为 h，
   由内部推导，不增加公开字段。
 - 成功返回原子登记结果；message.sequence 是该 channel 的登记序号。
-- currentFrontier 由 Channel 从截至成功登记序号的固定历史前缀计算，
-  不要求策略理解或返回 Frontier；可能含未观察到的其他端消息。
+- currentFrontier 在 append 前已从截至 S 的历史计算；
+  CAS 成功后仅将本端项更新为新 hash，即为该登记位置的前沿。
+  不需登记后再访问存储生成反馈，不要求策略理解 Frontier；
+  其中可能包含发送者未观察到的其他端消息。
   精确历史重投时使用本次读取边界 S 的前沿，不伪称恢复了原登记时的最新状态。
 - C(message) 覆盖消息自身因果历史；不能用 currentFrontier 替代。
 
@@ -209,21 +211,26 @@ Channel 先读取最新已登记序号 S，再读取截至 S 的历史，
 若相同 hash 对应不同字节、或只在全局 blob 中存在而未在目标 channel 登记，
 不能当作成功重投。
 
-策略显式返回存储 CAS 冲突，Channel 保持原 Message 不变，重新读取并完整核验后重试。
+策略显式返回存储 CAS 冲突，Channel 返回 ConcurrentModificationError，确定此次未写入。
+不默认进行隐藏的自动重试。调用者可保留原 Message，再次调用 send 重新读取并核验。
 其他端追加也会推进 channel 序号、造成存储冲突，但本身不是消息的因果错误。
 若本端已前进且不是精确重投，则原消息不能继续追加，Channel 显式报告本端 tip 过期。
-重试次数 / 取消规则待定，不允许无限隐藏重试或把耗尽当成成功。
+不定义 RetryExhaustedError；未来若增加自动重试，应另行明确策略，不改变消息依据。
 不同端可以并发发送，但策略仍需为成功登记原子分配 channel 全局序号。
 首次出现的端可以从 bottom 发送，不需核心 join；
 endpointId 的使用权由上层验证，开放维度不等于业务授权。
 
 ### read：Frontier 续读，按登记序号分页
 
-每次调用先读取最新已登记序号 S，Channel 以不可变历史前缀 sequence <= S
+每次 read 是独立事件，不创建读取 session，不在分页之间固定历史快照。
+Channel 可在本次调用内部选择最新已登记序号 S，以不可变历史前缀 sequence <= S
 计算一致视图 F，返回 Past(F) 中尚未被 Past(after) 覆盖的消息，
 按 sequence 升序取最多 limit 条。Past 包含前沿引用节点及其全部因果历史。
-after 必须是目标 channel 内合法、闭合且被 F 覆盖的前沿；
+after 必须是目标 channel 内合法、闭合的前沿；
 未知 hash、缺依赖或非法前沿显式失败，不自动重置为起点。
+已验证的 after 若含本次内部初选 S 之后的已登记节点，读取截止位置必须覆盖它；
+这是内部读取边界的选择，不是调用方错误，不定义 FrontierBeyondReadBoundaryError。
+不要求调用者提供或维持 session 边界。
 
 返回规则：
 
@@ -271,13 +278,13 @@ if (!watched.ok) {
   report(watched.error);
   return;
 }
-const cancelled = await watched.value();
-if (!cancelled.ok) report(cancelled.error);
+watched.value();
 ```
 
-调用取消函数立即停止向应用启动新回调，已经开始的处理不会自动撤销；
-返回 Promise<Result<void, WatchCancelError>> 等待底层资源释放结果。
-成功后重复取消返回成功；释放失败显式报告，允许再次尝试释放，不重新启用回调。
+取消函数同步、幂等，调用后不再启动应用回调，已经开始的处理不会自动撤销。
+不默认引入异步取消或 SubscriptionCancelError。
+若具体策略确实需要异步资源释放，应另行设计其释放 / 错误报告约定，
+不能吞掉释放失败；本版不假设存在这类资源。
 通知可以合并，只提示状态变化 / 继续读取，不是每条消息的交付或确认。
 订阅失败通过 onError 显式报告，不能静默假装订阅正常。
 是否立即发送初始状态、注册与首次状态如何避免漏通知、
@@ -326,7 +333,9 @@ afterSequence=0 从头开始；throughSequence 是 Channel 先取得的最新已
 此范围参数用于表达分页读取边界，具体签名仍可继续讨论。
 
 get 只查询目标 channel 的登记集合，缺失为 ok(undefined)，I/O 失败返回类型化 error。
-若返回记录的 sequence > 本次边界 S，Channel 不把它纳入截至 S 的视图。
+get 返回已登记记录，不创建 session；Channel 根据操作选择内部历史截止位置。
+发送若遇到 S 之后的新登记，不能按旧前态写入，交由序号 CAS 明确报告竞争。
+读取已验证的 after 之后的新登记不是游标错误，不作为公开边界错误返回。
 Channel 可用 get 逐步读取前沿引用节点、端内前驱及传递依赖；
 需要从 scan 重建各端 tip / 当前前沿。缓存与索引优化不改变这些校验职责。
 
@@ -349,12 +358,12 @@ Channel 的 send 流程是：
 → 读取截至 S 的记录并核验，识别精确历史重投
 → 重投返回原登记；否则验证原 Message
 → append(expectedSequence: S)
-→ 存储冲突则保持原 Message，重新观察、核验后重试
+→ 存储冲突返回 ConcurrentModificationError，不写入、不改 Message
 ```
 
 相同 channel 的多个 Channel 实例 / 进程共用同一个存储序号 CAS。
 即使两者检查到相同本端 tip，也只有一个能按相同 S 登记；
-另一个重新核验，不能自动产生端内分叉。
+另一个收到明确竞争错误，再次 send 时重新核验，不能自动产生端内分叉。
 本端 tip 与依赖检查属于 Channel，不属于策略；
 全局序号 CAS 将已完成的这些检查绑定到实际登记的存储前态。
 
@@ -370,8 +379,9 @@ Channel 的 send 流程是：
 
 这些是存储语义，不是业务校验。由此截至 S 的历史前缀不变，
 后续并发写入只在 S 之后；Channel 可自己形成一致读取边界，不要求快照对象。
-遇到本次边界外的新引用 / 不稳定输入时不能按混合视图宣告校验成功，
-错误分类与重新观察规则需在实现契约中明确。
+内部历史截止位置不是公开 session。
+发送前态变化由 append 的序号 CAS 处理；读请求不会因合法前沿晚于初选截止位置而失败。
+观察到高水位倒退、已登记内容改变等真正违约时，应报告坏历史或存储契约错误。
 
 若未来允许删除、改写或其他不推进登记序号的状态变化，
 最新序号就不足以充当 revision，需要另设版本机制，不能沿用本承诺。
@@ -447,185 +457,227 @@ contentType 按声明的 UTF-8 字节编码，与 frontier 和 content 一起受
 
 #### 错误结构与各 API 的错误集合
 
-错误按 code 判别，details 与 code 一一对应，不使用 any 或任意字典。
-本版用 ErrorCatalog 集中表达各错误的必要数据；ErrorOf 展开为判别联合。
-以下为 API 提案，不将策略提供的错误文本或 cause 当作安全可直接展示的内容。
+逐 API 直接列出错误类型，不使用 ErrorCatalog、ErrorOf、映射类型或通用错误注册表。
+以下类型名称用于 review 行为；每个具体错误最终会有自己的 code 与必要详情，
+不在这里展开重复的 interface。不得把策略错误文本或 cause 自动当作安全展示内容。
+
+##### createChannel
 
 ```ts
-interface ErrorCatalog {
-  INVALID_OPTIONS: { field: string; reason: string };
-  INVALID_MESSAGE: { field: string; reason: string };
-  INVALID_READ_REQUEST: { field: string; reason: string };
-  INVALID_FRONTIER: { field: string; reason: string };
-  UNKNOWN_HASH: { endpointId: EndpointId; hash: MessageHash };
-  FRONTIER_BEYOND_BOUNDARY: { hash: MessageHash; sequence: number; boundary: number };
-  ENDPOINT_MISMATCH: { hash: MessageHash; expected: EndpointId; actual: EndpointId };
-  FRONTIER_NOT_CLOSED: {
-    endpointId: EndpointId;
-    required: MessageHash;
-    declared: MessageHash | null;
-  };
-  STALE_ENDPOINT_TIP: {
-    endpointId: EndpointId;
-    declaredTip: MessageHash | null;
-    actualTip: MessageHash | null;
-  };
-  OBSERVATION_REGRESSION: {
-    endpointId: EndpointId;
-    required: MessageHash;
-    declared: MessageHash | null;
-  };
-  INVALID_ENCODING: { hash: MessageHash; field: string; reason: string };
-  HASH_MISMATCH: { expected: MessageHash; computed: MessageHash };
-  HASH_COLLISION: { hash: MessageHash };
-  MISSING_DEPENDENCIES: { referencingHash: MessageHash; missing: readonly MessageHash[] };
-  FORK: {
-    endpointId: EndpointId;
-    predecessor: MessageHash | null;
-    successors: readonly [MessageHash, MessageHash];
-  };
-  CAUSAL_CYCLE: { hashes: readonly MessageHash[] };
-  INVALID_REGISTRATION: { sequence: number; hash: MessageHash; reason: string };
-  STRATEGY_CONTRACT_VIOLATION: { operation: string; reason: string };
-  LIMIT_EXCEEDED: { limit: string; maximum: number; actual: number };
-  CRYPTO_UNAVAILABLE: { reason: string };
-  CRYPTO_FAILURE: { cause: unknown };
-  STORAGE_UNAVAILABLE: { operation: string; cause: unknown };
-  STORAGE_READ_FAILED: { operation: string; cause: unknown };
-  STORAGE_WRITE_FAILED: { cause: unknown };
-  INVALID_STORAGE_REQUEST: { field: string; reason: string };
-  SEQUENCE_CONFLICT: { expectedSequence: number; actualSequence: number };
-  SEQUENCE_EXHAUSTED: { latestSequence: number };
-  RETRY_EXHAUSTED: { attempts: number; expectedSequence: number; actualSequence: number };
-  APPEND_OUTCOME_UNKNOWN: { hash: MessageHash; cause: unknown };
-  SEND_RECEIPT_FAILED: { message: RegisteredMessage; cause: GetStateError };
-  INVALID_OBSERVER: { field: string; reason: string };
-  WATCH_START_FAILED: { cause: unknown };
-  WATCH_FAILED: { cause: unknown };
-  WATCH_CANCEL_FAILED: { cause: unknown };
-}
-
-type ErrorOf<K extends keyof ErrorCatalog> = {
-  [C in K]: {
-    readonly code: C;
-    readonly message: string;
-    readonly details: Readonly<ErrorCatalog[C]>;
-  }
-}[K];
-
-type CreateChannelError = ErrorOf<"INVALID_OPTIONS">;
-
-type FrontierError = ErrorOf<
-  "INVALID_FRONTIER" | "UNKNOWN_HASH" | "FRONTIER_BEYOND_BOUNDARY" |
-  "ENDPOINT_MISMATCH" | "FRONTIER_NOT_CLOSED"
->;
-type HistoryError = ErrorOf<
-  "INVALID_ENCODING" | "HASH_MISMATCH" | "HASH_COLLISION" |
-  "MISSING_DEPENDENCIES" | "FORK" | "CAUSAL_CYCLE" |
-  "INVALID_REGISTRATION" | "STRATEGY_CONTRACT_VIOLATION"
->;
-type ResourceError = ErrorOf<"LIMIT_EXCEEDED">;
-type CryptoError = ErrorOf<"CRYPTO_UNAVAILABLE" | "CRYPTO_FAILURE">;
-type PersistenceReadError = ErrorOf<"STORAGE_UNAVAILABLE" | "STORAGE_READ_FAILED">;
-type PersistenceGetError = PersistenceReadError | ErrorOf<"INVALID_STORAGE_REQUEST">;
-type PersistenceScanError = PersistenceReadError | ErrorOf<"INVALID_STORAGE_REQUEST">;
-type PersistenceAppendError = ErrorOf<
-  "INVALID_STORAGE_REQUEST" | "SEQUENCE_CONFLICT" | "SEQUENCE_EXHAUSTED" |
-  "STORAGE_UNAVAILABLE" | "STORAGE_WRITE_FAILED" | "APPEND_OUTCOME_UNKNOWN"
->;
-type PersistenceWatchStartError = ErrorOf<
-  "INVALID_OBSERVER" | "STORAGE_UNAVAILABLE" | "WATCH_START_FAILED"
->;
-type PersistenceWatchRuntimeError = ErrorOf<"STORAGE_UNAVAILABLE" | "WATCH_FAILED">;
-type WatchCancelError = ErrorOf<"WATCH_CANCEL_FAILED">;
-
-type GetStateError = HistoryError | ResourceError | CryptoError | PersistenceReadError;
-type ReadError = FrontierError | GetStateError | ErrorOf<"INVALID_READ_REQUEST">;
-type SendError = FrontierError | GetStateError |
-  ErrorOf<
-    "INVALID_MESSAGE" | "STALE_ENDPOINT_TIP" | "OBSERVATION_REGRESSION" |
-    "RETRY_EXHAUSTED" | "SEQUENCE_EXHAUSTED" | "STORAGE_WRITE_FAILED" |
-    "APPEND_OUTCOME_UNKNOWN" | "SEND_RECEIPT_FAILED"
-  >;
-type WatchStartError = PersistenceWatchStartError;
-type WatchRuntimeError = PersistenceWatchRuntimeError | GetStateError;
+type CreateChannelError = InvalidOptionsError;
 ```
 
-getState / read 也可能核验已存节点 hash，故包含 CryptoError，
-不是仅 send 可能使用 hash 计算。
-Channel 自己构造策略请求；策略若因此返回 INVALID_STORAGE_REQUEST，
-表明两侧接口契约不一致，转换为 STRATEGY_CONTRACT_VIOLATION，不能当成业务输入错误。
-SEQUENCE_CONFLICT 由 send 内部处理，重试耗尽才返回 RETRY_EXHAUSTED；
-若重新检查发现本端已前进，返回 STALE_ENDPOINT_TIP 而非继续盲目重试。
-
-#### 每种错误的触发情况
-
-| code | 情况与必要解释 |
+| 错误 | 发生情况与必要信息 |
 | --- | --- |
-| INVALID_OPTIONS | createChannel 配置缺失、限额非法或策略方法不可调用；同步返回，尚未访问存储。 |
-| INVALID_MESSAGE | endpointId、contentType、content 等字段不符合已确定的结构 / 字符要求；不校验业务内容是否符合 contentType。 |
-| INVALID_READ_REQUEST | read.limit 不是正整数或请求结构错误；超过配置上限则用 LIMIT_EXCEEDED。 |
-| INVALID_FRONTIER | 映射结构、key 或 hash 形状非法，重复维度、显式 null / undefined 等；不得自动规范化为合法前沿。 |
-| UNKNOWN_HASH | 调用方前沿直接引用的 hash 不在目标 channel 登记集合中；不当作 bottom，也不查其他 channel。 |
-| FRONTIER_BEYOND_BOUNDARY | 引用记录已存在但 sequence 大于本次固定读取边界 S；不能混入旧视图。send 可重新观察后核验，耗尽或不能继续时明确返回，read 不偷偷移动边界。 |
-| ENDPOINT_MISMATCH | 调用方某维度引用的节点属于另一 endpoint；details 给出引用 hash 与 expected / actual。 |
-| FRONTIER_NOT_CLOSED | 输入前沿遗漏被引用节点的传递因果依据，或给出了不足以覆盖它的位置；不补 refs。 |
-| STALE_ENDPOINT_TIP | 排除精确重投后，消息声明的本端位置不是截至 S 的本端 tip；本端竞争通常产生此错误。 |
-| OBSERVATION_REGRESSION | 相比本端上一节点，声明的其他端位置后退或遗漏；用链祖先关系判断，不用 sequence 大小替代。 |
-| INVALID_ENCODING | 已存数据无法严格规范编码 / 解码，例如无效字符串、重复维度或截断规范字节；指历史损坏，而非新发送字段错误。 |
-| HASH_MISMATCH | 已存消息按规范计算出的 hash 不等于存储声明的 hash；不得继续当作合法依赖。 |
-| HASH_COLLISION | 发现相同 hash 对应不同规范消息字节；只报告完整性冲突，不选一份为真。 |
-| MISSING_DEPENDENCIES | 已存节点的历史依赖缺失；区别于调用方直接引用未知 hash，意味着已有历史不完整。 |
-| FORK | 已有历史中同端同一前驱有两个不同后继；提供前驱与两个后继证据，不选赢家。 |
-| CAUSAL_CYCLE | 已存依赖图形成循环，不能形成合法因果历史；提供相关 hash，拒绝输出合法状态。 |
-| INVALID_REGISTRATION | 登记序号非法、重复、依赖序号不小于消息序号，或记录关系不满足只追加登记规则；给出记录及原因。 |
-| STRATEGY_CONTRACT_VIOLATION | 可观察到策略违约，例如 scan 乱序 / 越界、get 返回另一 hash、已读记录发生变化、高水位回退或成功 append 返回不同消息；不伪装为普通空数据。 |
-| LIMIT_EXCEEDED | 内容、编码、前沿维度、页大小或历史访问量超过配置限制；给出限额名称、maximum / actual，不截断为成功。 |
-| CRYPTO_UNAVAILABLE | 运行环境没有所需 SHA-256 能力；不能降级为另一算法或占位 hash。 |
-| CRYPTO_FAILURE | 已识别的 hash provider 执行失败；保留 cause，不把未知程序错误一律归入此项。 |
-| STORAGE_UNAVAILABLE | 对应操作无法接入存储。用于 append 时必须确定尚未写入；若可能已写入，必须改报 APPEND_OUTCOME_UNKNOWN。 |
-| STORAGE_READ_FAILED | getLatestSequence / get / scan 的读取失败；不返回 0、undefined 或空列表伪装正常结果。 |
-| STORAGE_WRITE_FAILED | append 确定未登记成功的写入失败，例如原子事务确定回滚；不知道是否回滚不能用此项。 |
-| INVALID_STORAGE_REQUEST | 直接调用策略时的 hash / expectedSequence / scan 数值范围 / limit 等基础参数非法；策略只检查存储参数，不检查因果或业务格式。 |
-| SEQUENCE_CONFLICT | append 原子比较发现最新序号不是 expectedSequence；带两值，保证本次未写入。 |
-| SEQUENCE_EXHAUSTED | 无法分配合法且更大的登记序号；本次不写入，不回绕或复用序号。 |
-| RETRY_EXHAUSTED | Channel 因存储序号竞争或边界变化重试至配置上限；没有得到成功或不确定的 append，返回次数与最近序号，不能无限隐藏重试。 |
-| APPEND_OUTCOME_UNKNOWN | 写入可能已成功，但响应丢失或持久化结果无法确认；带原 hash。不得说“未发送”，不得更换消息内容 / 前沿盲目重发。 |
-| SEND_RECEIPT_FAILED | 已确认目标消息登记，但计算 currentFrontier 等反馈步骤失败；带已登记 RegisteredMessage 和 GetStateError，不能当成未写入。 |
-| INVALID_OBSERVER | watch 缺少可调用的 onChange / onError 等结构错误；不是用户回调执行时抛出的程序异常。 |
-| WATCH_START_FAILED | 注册订阅失败，尚未取得可用订阅；策略应清理部分建立的资源，无法清理时在失败详情说明，不能声称注册成功。 |
-| WATCH_FAILED | 已注册订阅运行期间的已识别通知机制失败；通过 onError 报告，不伪造正常变化。订阅是否终止待定。 |
-| WATCH_CANCEL_FAILED | 停止回调后，底层释放订阅资源失败；取消结果显式报告，可再尝试释放，不能恢复应用回调。 |
+| InvalidOptionsError | 配置缺失、限额非法、策略缺少必要可调用方法；说明字段与原因。创建不访问存储。 |
 
-存储完整性表不能替代一致性保证：核心只能诊断它实际观察到的违约，
-不能证明策略没有漏报一条尚不可见的记录；策略仍必须兑现只追加 / 高水位语义。
-历史内发现的端归属 / 闭包 / 观测倒退错误属于坏历史，
-由 INVALID_ENCODING 或 INVALID_REGISTRATION 携带原因与记录标识，
-不误报成此次发送者修改其请求即可修复的问题。
+##### send
+
+```ts
+type SendError =
+  | InvalidMessageError
+  | InvalidFrontierError
+  | UnknownReferenceError
+  | ReferenceEndpointMismatchError
+  | FrontierNotClosedError
+  | StaleEndpointTipError
+  | ObservationRegressionError
+  | InvalidHistoryError
+  | StrategyContractError
+  | LimitExceededError
+  | HashCalculationError
+  | StorageReadError
+  | StorageWriteError
+  | SequenceExhaustedError
+  | ConcurrentModificationError
+  | AppendOutcomeUnknownError;
+```
+
+| 错误 | 发生情况与必要信息 |
+| --- | --- |
+| InvalidMessageError | endpointId、contentType 或 content 结构 / 字符要求非法；说明字段，不检查业务内容是否符合格式。 |
+| InvalidFrontierError | frontier 结构、端 ID 或 hash 表示非法，包括重复维度、显式 null / undefined；不自动修正。 |
+| UnknownReferenceError | 请求直接引用的消息未登记在目标 channel；带引用端与 hash，不当作 bottom。 |
+| ReferenceEndpointMismatchError | 某维度引用的消息发送端与维度不同；带 expected / actual 与 hash。 |
+| FrontierNotClosedError | 前沿未覆盖引用节点的传递依据；带缺少的端、所需位置与声明位置，不补 refs。 |
+| StaleEndpointTipError | 排除精确重投后，本端项不是当前 tip；带发送端、declaredTip / actualTip。 |
+| ObservationRegressionError | 相比本端上一节点，对其他端观察后退或遗漏；带端、required / declared，按祖先关系比较。 |
+| InvalidHistoryError | 已登记历史损坏，无法安全继续；下文列出具体原因与证据。 |
+| StrategyContractError | 可观察到策略读取 / 返回值违约；说明操作与原因。不同于普通 I/O 失败。 |
+| LimitExceededError | 消息大小、前沿维度或校验工作量超限；带限制名及 maximum / actual。 |
+| HashCalculationError | SHA-256 不可用或已识别的计算失败；说明原因，不降级算法。 |
+| StorageReadError | 最新序号、历史消息或扫描读取失败；带操作与原因，存储不可用属于其中原因。 |
+| StorageWriteError | append 失败且确定此次未登记，例如确定回滚；不确定是否写入不得归入此项。 |
+| SequenceExhaustedError | 不能再分配合法且更大的序号；带最新序号，本次不写入、不复用序号。 |
+| ConcurrentModificationError | Channel 校验后 append 的序号 CAS 失败；带 expectedSequence / actualSequence，保证此次未写入。调用者可用原 Message 再次 send，不自动改前沿。 |
+| AppendOutcomeUnknownError | 写入可能已成功，但响应丢失或无法核实策略的登记结果；带原 hash 与原因，不能声称未发送。 |
+
+append 前已经算出截至 S 的当前前沿；CAS 成功后更新本端项即可生成反馈。
+因此不定义 SendReceiptError，不为登记后的状态读取再制造失败步骤。
+精确重投也在返回前计算此次观察的当前前沿，不伪称恢复原登记时状态。
+策略成功后若返回值不可信、无法确认登记，仍必须返回 AppendOutcomeUnknownError，
+不能把这种情况当作确定未写入的 StrategyContractError。
+
+##### read
+
+```ts
+type ReadError =
+  | InvalidReadRequestError
+  | InvalidFrontierError
+  | UnknownReferenceError
+  | ReferenceEndpointMismatchError
+  | FrontierNotClosedError
+  | InvalidHistoryError
+  | StrategyContractError
+  | LimitExceededError
+  | HashCalculationError
+  | StorageReadError;
+```
+
+| 错误 | 发生情况与必要信息 |
+| --- | --- |
+| InvalidReadRequestError | 请求结构或 limit 不是正整数；超过配置上限则为 LimitExceededError。 |
+| InvalidFrontierError | after 的结构或 ID / hash 表示非法，不能重置为起点。 |
+| UnknownReferenceError | after 引用未登记消息；带端和 hash。 |
+| ReferenceEndpointMismatchError | after 维度与引用消息发送端不同。 |
+| FrontierNotClosedError | after 未覆盖引用节点依赖，不能作为合法因果进度。 |
+| InvalidHistoryError | 扫描或核验发现已有历史损坏，不能返回可信分页。 |
+| StrategyContractError | 策略返回乱序、越界、非所查询 hash 等可观察违约。 |
+| LimitExceededError | 页大小、字节数或验证 / 扫描工作量超限，不截断为成功。 |
+| HashCalculationError | 核验已存消息的 SHA-256 操作失败。 |
+| StorageReadError | 本次独立读取期间最新序号、get 或 scan 失败；不返回空分页伪装正常结束。 |
+
+没有读取 session；不定义 FrontierBeyondReadBoundaryError。
+读取失败不返回可供推进的 nextFrontier，应用保留原 after。
+
+##### getState
+
+```ts
+type GetStateError =
+  | InvalidHistoryError
+  | StrategyContractError
+  | LimitExceededError
+  | HashCalculationError
+  | StorageReadError;
+```
+
+| 错误 | 发生情况 |
+| --- | --- |
+| InvalidHistoryError | 历史不合法，无法计算可信前沿。 |
+| StrategyContractError | 读取观察到策略违约，例如高水位回退或返回错误节点。 |
+| LimitExceededError | 状态计算访问量超限。 |
+| HashCalculationError | 状态计算需要核验历史，SHA-256 操作失败。 |
+| StorageReadError | 最新序号或历史读取失败。 |
+
+##### watch 注册、运行与取消
+
+```ts
+type WatchStartError =
+  | InvalidObserverError
+  | SubscriptionStartError;
+
+type WatchRuntimeError =
+  | SubscriptionError
+  | InvalidHistoryError
+  | StrategyContractError
+  | LimitExceededError
+  | HashCalculationError
+  | StorageReadError;
+```
+
+| 错误 | 阶段与情况 |
+| --- | --- |
+| InvalidObserverError | 注册参数缺少可调用的 onChange / onError；不指回调执行时的程序异常。 |
+| SubscriptionStartError | 底层订阅注册失败，包括存储不可用；不得提前返回可用订阅，清理部分注册资源。 |
+| SubscriptionError | 已注册后底层通知机制发生已识别的失败；通过 onError 报告，是否终止订阅待定。 |
+| InvalidHistoryError | 通知后计算状态时发现历史损坏。 |
+| StrategyContractError | 通知后读取状态观察到策略违约。 |
+| LimitExceededError | 通知后的状态计算超限。 |
+| HashCalculationError | 通知后的历史核验 hash 失败。 |
+| StorageReadError | 通知后读取最新状态失败。 |
+
+取消保持同步、幂等，不默认定义异步取消错误。
+用户回调自身抛错不是 InvalidObserverError，异常上报机制仍待定，不吞错。
+
+##### PersistenceStrategy：每个请求直接列出错误
+
+```ts
+type PersistenceReadError = StorageReadError;
+type PersistenceGetError = InvalidHashError | StorageReadError;
+type PersistenceScanError = InvalidScanRequestError | StorageReadError;
+
+type PersistenceAppendError =
+  | InvalidAppendRequestError
+  | SequenceConflictError
+  | SequenceExhaustedError
+  | StorageWriteError
+  | AppendOutcomeUnknownError;
+
+type PersistenceWatchStartError = InvalidObserverError | SubscriptionStartError;
+type PersistenceWatchRuntimeError = SubscriptionError;
+```
+
+| API / 错误 | 情况与必要解释 |
+| --- | --- |
+| getLatestSequence / StorageReadError | 读取已登记高水位失败；不能返回 0 伪装空 channel。 |
+| get / InvalidHashError | 直接调用策略提供的 hash 形状不合法；策略不计算内容 hash。 |
+| get / StorageReadError | 查询失败，包括存储不可用；未找到是 ok(undefined)，不是此错误。 |
+| scan / InvalidScanRequestError | 数值范围、序号或 limit 非法；不接收或校验 Frontier。 |
+| scan / StorageReadError | 范围查询失败；不能用空数组伪装成功。 |
+| append / InvalidAppendRequestError | expectedSequence 或存储请求基本结构非法；不验证端 tip、因果、闭包或业务内容。 |
+| append / SequenceConflictError | 原子比较发现实际序号不等于预期；带 expected / actual，确定此次未写入。Channel 对外转换为 ConcurrentModificationError。 |
+| append / SequenceExhaustedError | 无法分配合法新序号，本次不写入。 |
+| append / StorageWriteError | 包括存储不可用等确定未写入的故障；不能确认未写入则报告下一项。 |
+| append / AppendOutcomeUnknownError | 写入响应丢失等导致登记结果无法确认；不能伪装成 CAS 冲突。 |
+| watch / InvalidObserverError | 通知回调结构非法。 |
+| watch / SubscriptionStartError | 注册失败；存储不可用是原因而非独立错误分支。 |
+| watch 的 onError / SubscriptionError | 注册后的通知失败；策略不计算状态，因此不返回因果或 hash 错误。 |
+
+Channel 构造的存储请求若被策略作为非法请求拒绝，
+应报告 StrategyContractError，而非要求用户修改原本合法的 Message。
+此错误不代替 StorageReadError / StorageWriteError，也不能声称检测出所有漏记录。
+
+##### InvalidHistoryError 的原因，不是各 API 的额外顶层错误
+
+| 原因 | 证据与情况 |
+| --- | --- |
+| 编码非法 | 已存数据不能严格规范编码 / 解码；记录 hash、字段或字节位置及原因。 |
+| hash 不匹配 | 存储 hash 与规范消息重新计算出的 hash 不同；记录 expected / computed。 |
+| 相同 hash 不同内容 | 发现相同内容地址对应不同规范字节，不选一份为真。 |
+| 缺依赖 | 已存节点引用缺失历史；记录引用节点与缺失 hash，区别于请求直接引用未知消息。 |
+| fork | 同端同一前驱有两个不同后继；给出端、前驱和两个后继证据。 |
+| 循环 | 已存依赖形成循环；给出相关 hash，拒绝输出合法状态。 |
+| 登记非法 | 序号非法 / 重复、依赖序号不小于消息序号等，给出记录与原因。 |
+| 已存因果声明非法 | 已存节点端归属、闭包或观测单调性不合法；不是此次请求改一下就能修复的错误。 |
+
+StrategyContractError 表示可观察的接口违约：scan 乱序 / 越界、get 返回另一 hash、
+已读记录改变或高水位回退等。成功 append 的不可置信结果按登记不确定处理。
+核心不能证明策略没有漏报尚不可见的记录，策略仍需兑现只追加 / 高水位语义。
 
 #### 正常结果不是错误
 
-- get 未找到：ok(undefined)；Channel 据上下文区分 UNKNOWN_HASH / MISSING_DEPENDENCIES。
+- get 未找到：ok(undefined)；Channel 据上下文区分 UnknownReferenceError / 坏历史缺依赖。
 - scan / read 合法范围内无消息：ok(空结果)，不当作存储故障。
 - 精确历史重投：ok(原登记记录)，无公开 already-present 分支。
-- 多个端的合法并发：正常历史，不是 FORK。
-- 幂等取消已成功结束的订阅：ok(undefined)。
+- 多个端的合法并发：正常历史，不是坏历史中的 fork。
+- 取消已结束的订阅：无操作，不额外报错。
 
 #### 写入结果与异常边界
 
 send 的登记结果分三类：
 
-1. 尚未写入：输入 / 校验失败、确定未写入的存储错误、重试耗尽。
-2. 不确定：APPEND_OUTCOME_UNKNOWN；先按原 hash 查询并核验。
+1. 此次尚未写入：输入 / 校验失败、确定未写入的存储错误或登记竞争。
+   不推断此前失败请求是否写入。
+2. 不确定：AppendOutcomeUnknownError；先按原 hash 查询并核验。
    未查到不能在不可靠读取上证明未写入，应遵守策略一致性和恢复约定。
-3. 已确认登记：正常 SendReceipt，或 SEND_RECEIPT_FAILED 中的 message。
-   后者可重查状态 / 使用原消息精确重投，不改写前沿生成新消息。
+3. 已确认登记：正常 SendReceipt，不附带登记后状态读取步骤。
+   可使用原消息精确重投，但不改写前沿生成新消息。
 
-append 收到不确定结果后，Channel 不能把它当作普通 SEQUENCE_CONFLICT 自动重试；
+append 收到不确定结果后，Channel 不能把它当作普通 SequenceConflictError 自动重试；
 应先确认原登记，不能确认则将不确定结果交给调用者。
 若策略成功返回后出现可观察违约、记录本身都不能可信确认，
 按不确定登记结果报告，并保留违约原因，而不是暗示没有写入。
-若尚未写入且已存历史损坏，HistoryError 表示无法继续安全操作。
+若尚未写入且已存历史损坏，InvalidHistoryError 表示无法继续安全操作。
 
 Strategy 可预期的操作失败也必须返回 Result；未约定的 throw / reject、
 用户回调自身异常与包内部程序缺陷仍属于异常边界，
@@ -687,7 +739,8 @@ send 成功值的 receipt.value.currentFrontier 不替代 actuallyObservedFronti
 3. 空 channel、新端首次发送、多端并发、落后但合法的对端位置都可处理。
 4. 本端 tip 过期、观测倒退、缺依赖、不闭合和 fork 明确失败且不改变声明。
 5. Channel 检查本端 tip 与依赖，策略只做 expectedSequence 的原子 CAS 和序号分配；
-   多实例同端竞争不产生分叉，其他端推进引发存储冲突后保留原消息重试。
+   多实例同端竞争不产生分叉，其他端推进引发存储冲突时明确返回登记竞争，
+   调用者再次发送时保留原消息并重新核验。
    所有依赖先于消息，失败不返回登记成功。
 6. 精确重投返回原 sequence；tip 有后继也不新建记录；
    其他 channel 的登记或全局 blob 不能当作目标 channel 已登记。
@@ -701,13 +754,14 @@ send 成功值的 receipt.value.currentFrontier 不替代 actuallyObservedFronti
     内部派生的 C(message) 与登记 currentFrontier 有并发案例区分，
     任何状态或反馈都不被描述为业务已处理。
 12. 最新序号先于校验读取；0 表示空 channel。以旧序号 append 原子失败且不写入。
-    分页固定 throughSequence 边界，过程中新增不会混入本页；
+    每次 read 独立选择内部读取截止位置，分页之间没有固定 session；
+    合法 after 不因超过初选截止位置而产生公开错误；
     策略不需要理解 Frontier、实现快照对象或提供悲观锁。
-13. 各 API 的 Result 错误联合可按 code 穷尽处理；存储故障不变成空结果，
+13. 各 API 直接列出的 Result 错误可分类处理；存储故障不变成空结果，
     输入错误与坏历史区分，冲突不当作 I/O 失败。
-    用响应丢失、事务回滚、append 成功后状态读取失败分别验证
-    APPEND_OUTCOME_UNKNOWN、STORAGE_WRITE_FAILED、SEND_RECEIPT_FAILED，
-    并验证取消释放错误不重新启动回调。
+    用响应丢失、事务确定回滚、序号 CAS 竞争分别验证
+    AppendOutcomeUnknownError、StorageWriteError、ConcurrentModificationError；
+    确认 CAS 成功后的反馈不再次读取存储，取消保持同步、幂等。
 
 ## 待解决问题
 
@@ -716,7 +770,7 @@ send 成功值的 receipt.value.currentFrontier 不替代 actuallyObservedFronti
 2. sequence 使用 number、bigint 还是其他表示；合法范围与耗尽策略。
 3. Frontier 的容器与解析辅助函数；端 ID 和 hash 表示的精确约束。
 4. 是否接受传递闭包规则 C(q) <= V。
-5. 各错误细节字段的最终形状、存储 CAS 的重试上限 / 取消、
+5. 各直接错误类型详情字段的最终形状；不默认自动重试，
    不确定登记后的恢复规则；已采用逐 API Result，不再待选正常失败用 reject。
 6. watch 初始通知、无漏订阅边界、观察者异常和订阅错误后的行为。
 7. read 条数 / 字节限额、资源 profile、AbortSignal 与关闭资源是否需要接口。

@@ -1,2 +1,3 @@
 {"sequence":1,"type":"setAlias","payload":{"alias":"causal-channel-core-api"}}
 {"sequence":2,"type":"acceptIdeal","payload":{"idealRevision":"dac676df3580e0714027fa3b983bf24c4704be07"}}
+{"sequence":3,"type":"acceptInner","payload":{"implementationRevision":"3b447750e72580b2acbe2928ec56a6dcbce187c5"}}

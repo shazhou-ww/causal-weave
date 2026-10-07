@@ -21,12 +21,12 @@
 
 ### Deployment steps
 
-- [ ] **D-S01:** 确认发布前提与登录
-- [ ] **D-S02:** 确认并上传准确发布包
-- [ ] **D-S03:** 从 registry 验证消费结果
+- [x] **D-S01:** 确认发布前提与登录
+- [x] **D-S02:** 确认并上传准确发布包
+- [x] **D-S03:** 从 registry 验证消费结果
 
 ### Deployment acceptance criteria
 
-- [ ] **D-AC01:** 发布前提明确
-- [ ] **D-AC02:** 准确版本可从 registry 获取
-- [ ] **D-AC03:** 外部安装与公共 API 正常
+- [x] **D-AC01:** 发布前提明确
+- [x] **D-AC02:** 准确版本可从 registry 获取
+- [x] **D-AC03:** 外部安装与公共 API 正常

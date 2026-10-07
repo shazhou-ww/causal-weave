@@ -72,3 +72,29 @@ pnpm 提示 Silvermoon 间接原生依赖的 build scripts 未启用；
 真实数据库 / 网络策略的集成、分布式协调、性能基准、
 许可选择、npm 发布与现实世界部署均未执行，也不属于本次实现验收证据。
 测试内存策略仅是夹具，不作为生产存储策略导出。
+
+## 0.1.0 首次发布准备复核（2026-10-07）
+
+本节取代前节关于“尚未选择许可 / 未实际生成包”的旧候选描述；
+旧验证记录保留用于追溯。用户授权公开版本准备和 MIT，
+实际 npm registry 上传仍未授权执行。
+
+- pnpm typecheck 再次通过。
+- pnpm test 再次通过，34 项通过，无跳过。
+- npm pack 实际执行 prepack 构建并生成 causal-weave-0.1.0.tgz，
+  包保存在会话 artifacts，不进入 Git。
+- 包内 17 项：LICENSE、README、package.json、dist JS / 类型声明，
+  不包含 src、测试、Silvermoon metadata、node_modules 或凭据。
+- tarball shasum：e8e4c7ce2114fb96ab4c36229dca7d9cb81becf2。
+- tarball integrity：
+  sha512-BOZuM2EmD0ANp0tV5YBvFLlywNqvNt/Cmb9zUda+A7sBNwvW2jac8B6PJWk7nznyID2vTzye5VbvyKKRXkandg==。
+- 独立于仓库的临时消费目录 npm install 本地 tarball，只有一个运行时包，
+  未安装 Silvermoon / TypeScript 等开发依赖；不执行安装脚本。
+- 从安装后的包入口运行 send/read、Frontier 进度、version=0.1.0、
+  license=MIT、private 缺失及 dependencies 缺失校验均通过。
+- 独立消费目录的 TypeScript NodeNext / strict 声明消费验证通过，
+  使用实际安装包的 exports/types，并检查缺失 contentType 的编译期拒绝。
+
+npm whoami 返回 E401，用户登录待完成；包名公开查询返回 404，
+不保证未来名称注册成功。未执行 npm publish，也未将本地 tarball 安装验证
+冒充 registry 安装验证。发布配置变更需要新的 acceptInner。

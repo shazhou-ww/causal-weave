@@ -2,7 +2,7 @@
 
 面向 Node.js 22+ 和现代浏览器的 TypeScript 多端因果消息 Channel。
 ESM-only，运行时零依赖，持久化由调用方提供。
-当前是未发布的实现候选，package 标记 `private`；没有执行 npm 发布。
+当前是 `0.1.0` 首次公开发布候选，采用 MIT 许可证；尚未上传 npm registry。
 
 ## 四个操作
 
@@ -191,4 +191,4 @@ Silvermoon 只作为开发工具，通过 pnpm override 固定到支持 v2 的 G
 不进入运行时依赖。本包不依赖 Silvermoon 的业务抽象。
 测试用 Node 内置 runner；浏览器共享 smoke 入口为 `test/browser-smoke.mjs`，
 经本地 HTTP 服务加载后调用 `runBrowserSmoke()`，无需 Node API。
-许可和 npm 公开发布仍需另行确定，不执行自动发布。
+许可证为 MIT；实际 npm 上传仍需单独确认，不执行自动发布。

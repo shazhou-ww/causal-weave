@@ -13,7 +13,12 @@ watch 先注册，再异步报告初始状态；状态读取失败报告后继�
 
 目标为 Node.js 22+ 与支持 Web Crypto、TextEncoder、TextDecoder、Map 的现代浏览器。
 运行时代码不导入 Node 或 Silvermoon；Silvermoon 仅开发依赖。
-package 标记 private，许可和公开发布留待后续明确授权。
+用户于 2026-10-07 授权准备公开 causal-weave@0.1.0，采用 MIT；
+移除 private，补 repository / publishConfig / LICENSE，
+使用 prepack 构建，确保首次发布包有可用 dist。
+只授权发布准备，实际 registry 上传仍须用户明确确认。
+这些交付物变更产生新的 implementationRevision，
+原 acceptInner 保留为历史决定，不自动套用到新候选。
 用户授权 pnpm override 将 Silvermoon 开发工具固定到
 cfabf52936b7372d45f43e07ab813a2271fe4938，以使用未发布的 v2；
 不依赖本机路径、不修改 Silvermoon 源仓库。
@@ -90,3 +95,10 @@ README 记录完整策略语义、默认资源 profile 和运行限制。
 
 验证过程及结果见 [Evidence.md](./Evidence.md)。
 只将实现标为可验收候选；Ideal 内容及 acceptIdeal 事件均未改动。
+
+## 首次发布准备复核
+
+新增真实 tarball 打包及仓库外独立目录安装验证，
+检查 ESM 入口、类型声明、零运行时依赖、许可证与版本。
+发布前重新执行完整类型检查、测试及 Silvermoon 校验；
+具体证据补充到 Evidence.md。
